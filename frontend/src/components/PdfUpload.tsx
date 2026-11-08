@@ -1,9 +1,25 @@
-
 import { useState } from "react";
+import {
+  Paper,
+  Group,
+  Text,
+  Button,
+  Stack,
+  ThemeIcon,
+  Title,
+  Alert,
+  SimpleGrid,
+} from "@mantine/core";
+import { Dropzone, type FileWithPath } from "@mantine/dropzone";
+import {
+  IconUpload,
+  IconFileTypePdf,
+  IconX,
+  IconCheck,
+  IconAlertCircle,
+} from "@tabler/icons-react";
 import api from "../services/api";
-import "./PdfUpload.css";
 
-// Define the response structure from FastAPI
 interface UploadResponse {
   message: string;
   document_id: string;
@@ -14,166 +30,151 @@ interface UploadResponse {
   saved_chunks: number;
 }
 
-function PdfUpload() {
-  const [file, setFile] = useState<File | null>(null);
+interface PdfUploadProps {
+  onUploadSuccess?: () => void;
+}
 
+function PdfUpload({ onUploadSuccess }: PdfUploadProps) {
+  const [file, setFile] = useState<FileWithPath | null>(null);
   const [loading, setLoading] = useState(false);
-
   const [error, setError] = useState("");
-
   const [result, setResult] = useState<UploadResponse | null>(null);
 
-  // Handle file selection
-  const handleFileChange = (
-    event: React.ChangeEvent<HTMLInputElement>
-  ) => {
-    const selectedFile = event.target.files?.[0];
-
+  const handleDrop = (files: FileWithPath[]) => {
     setError("");
     setResult(null);
-
-    if (!selectedFile) {
-      setFile(null);
-      return;
-    }
-
-    // Only allow PDF files
-    if (!selectedFile.name.toLowerCase().endsWith(".pdf")) {
-      setError("Please select a PDF file.");
-      setFile(null);
-      event.target.value = "";
-      return;
-    }
-
-    setFile(selectedFile);
+    setFile(files[0] ?? null);
   };
 
-  // Upload PDF to FastAPI
   const handleUpload = async () => {
     if (!file) {
       setError("Please select a PDF file first.");
       return;
     }
-
     setLoading(true);
     setError("");
     setResult(null);
 
     try {
       const formData = new FormData();
-
       formData.append("file", file);
-
-      const response = await api.post<UploadResponse>(
-        "/pdf/upload",
-        formData
-      );
-
+      const response = await api.post<UploadResponse>("/pdf/upload", formData);
       setResult(response.data);
-
-      console.log("Upload successful:", response.data);
-
+      setFile(null);
+      onUploadSuccess?.();
     } catch (err: unknown) {
       console.error("Upload failed:", err);
-
       if (typeof err === "object" && err !== null && "response" in err) {
         const axiosError = err as {
-          response?: {
-            data?: {
-              detail?: string;
-            };
-          };
+          response?: { data?: { detail?: string } };
           message?: string;
         };
-
         setError(
           axiosError.response?.data?.detail ||
-          axiosError.message ||
-          "Upload failed. Please try again."
+            axiosError.message ||
+            "Upload failed. Please try again."
         );
       } else {
         setError("Unable to connect to the backend.");
       }
-
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="upload-container">
-
-      <div className="upload-header">
-        <h2>Upload Your PDF</h2>
-        <p>Upload a document to start asking questions.</p>
-      </div>
-
-      <div className="upload-box">
-
-        <div className="upload-icon">
-          📄
-        </div>
-
-        <input
-          type="file"
-          accept=".pdf,application/pdf"
-          onChange={handleFileChange}
-          disabled={loading}
-        />
-
-        {file && (
-          <div className="selected-file">
-            <span>Selected file:</span>
-            <strong>{file.name}</strong>
-            <small>
-              {(file.size / 1024 / 1024).toFixed(2)} MB
-            </small>
+    <Paper withBorder shadow="sm" radius="md" p="lg" maw={860} mx="auto">
+      <Stack gap="md">
+        <Group gap="xs">
+          <ThemeIcon variant="light" size="lg" radius="md">
+            <IconFileTypePdf size={20} />
+          </ThemeIcon>
+          <div>
+            <Title order={5}>Upload a PDF</Title>
+            <Text size="xs" c="dimmed">
+              Drop a document to index it for Q&amp;A.
+            </Text>
           </div>
+        </Group>
+
+        <Dropzone
+          onDrop={handleDrop}
+          onReject={() => setError("Please select a valid PDF file.")}
+          accept={["application/pdf"]}
+          multiple={false}
+          loading={loading}
+        >
+          <Group
+            justify="center"
+            gap="xl"
+            mih={140}
+            style={{ pointerEvents: "none" }}
+          >
+            <Dropzone.Accept>
+              <IconUpload size={48} color="var(--mantine-color-indigo-6)" />
+            </Dropzone.Accept>
+            <Dropzone.Reject>
+              <IconX size={48} color="var(--mantine-color-red-6)" />
+            </Dropzone.Reject>
+            <Dropzone.Idle>
+              <IconFileTypePdf size={48} color="var(--mantine-color-gray-5)" />
+            </Dropzone.Idle>
+
+            <div>
+              <Text size="lg" inline>
+                Drag a PDF here or click to select
+              </Text>
+              <Text size="sm" c="dimmed" inline mt={7}>
+                {file ? `Selected: ${file.name}` : "Only .pdf files are accepted"}
+              </Text>
+            </div>
+          </Group>
+        </Dropzone>
+
+        {error && (
+          <Alert
+            variant="light"
+            color="red"
+            icon={<IconAlertCircle size={18} />}
+          >
+            {error}
+          </Alert>
         )}
 
-        <button
-          className="upload-button"
+        <Button
+          leftSection={<IconUpload size={16} />}
           onClick={handleUpload}
           disabled={!file || loading}
+          loading={loading}
         >
-          {loading ? "Processing PDF..." : "Upload PDF"}
-        </button>
+          {loading ? "Processing PDF..." : "Upload & Index"}
+        </Button>
 
-      </div>
-
-      {loading && (
-        <div className="loading-message">
-          Please wait while we process your PDF...
-        </div>
-      )}
-
-      {error && (
-        <div className="error-message">
-          {error}
-        </div>
-      )}
-
-      {result && (
-        <div className="success-result">
-
-          <h3>PDF Uploaded Successfully!</h3>
-
-          <p><strong>Filename:</strong> {result.filename}</p>
-
-          <p><strong>Document ID:</strong> {result.document_id}</p>
-
-          <p><strong>Total Pages:</strong> {result.total_pages}</p>
-
-          <p><strong>Total Characters:</strong> {result.total_characters}</p>
-
-          <p><strong>Total Chunks:</strong> {result.total_chunks}</p>
-
-          <p><strong>Saved Chunks:</strong> {result.saved_chunks}</p>
-
-        </div>
-      )}
-
-    </div>
+        {result && (
+          <Alert
+            variant="light"
+            color="green"
+            icon={<IconCheck size={18} />}
+            title="PDF indexed successfully"
+          >
+            <SimpleGrid cols={2} spacing="xs" mt="xs">
+              <Text size="sm">
+                <b>Filename:</b> {result.filename}
+              </Text>
+              <Text size="sm">
+                <b>Pages:</b> {result.total_pages}
+              </Text>
+              <Text size="sm">
+                <b>Chunks:</b> {result.total_chunks}
+              </Text>
+              <Text size="sm">
+                <b>Characters:</b> {result.total_characters}
+              </Text>
+            </SimpleGrid>
+          </Alert>
+        )}
+      </Stack>
+    </Paper>
   );
 }
 

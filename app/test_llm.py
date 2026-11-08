@@ -1,5 +1,5 @@
 
-from app.llm_service import generate_answer
+from app.llm_service import generate_answer, LLMUnavailableError
 
 
 context = """
@@ -15,10 +15,14 @@ Spring IoC Container manages the dependencies.
 
 question = "What is Dependency Injection?"
 
-answer = generate_answer(
-    question=question,
-    context=context
-)
+try:
+    answer = generate_answer(
+        question=question,
+        context=context
+    )
 
-print("\n========== LLM ANSWER ==========")
-print(answer)
+    print("\n========== LLM ANSWER ==========")
+    print(answer)
+except LLMUnavailableError as exc:
+    print("\n========== LLM UNAVAILABLE ==========")
+    print(exc)

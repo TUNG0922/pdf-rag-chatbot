@@ -1,6 +1,8 @@
 
 import chromadb
 
+from app import config
+
 
 # Create a persistent ChromaDB client.
 # Database files will be saved inside data/chroma_db.
@@ -61,18 +63,23 @@ def save_chunks(
 def search_chunks(
         query_embedding: list[float],
         top_k: int = 3,
-        distance_threshold: float = 0.5
+        distance_threshold: float | None = None
 ):
+    if distance_threshold is None:
+        distance_threshold = config.DEFAULT_DISTANCE_THRESHOLD
+
     total_chunks = collection.count()
 
     if total_chunks == 0:
         return []
 
-    result_count = min(top_k, total_chunks)
+    # Over-fetch candidates so that, after removing duplicate chunk text,
+    # we can still return up to top_k distinct results.
+    candidate_count = min(max(top_k * 4, top_k), total_chunks)
 
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=result_count,
+        n_results=candidate_count,
         include=[
             "documents",
             "metadatas",
@@ -81,6 +88,7 @@ def search_chunks(
     )
 
     search_results = []
+    seen_texts = set()
 
     for index in range(len(results["ids"][0])):
 
@@ -90,12 +98,23 @@ def search_chunks(
         if distance > distance_threshold:
             continue
 
+        text = results["documents"][0][index]
+
+        # Skip duplicate chunk content (e.g. the same PDF indexed twice)
+        text_key = text.strip()
+        if text_key in seen_texts:
+            continue
+        seen_texts.add(text_key)
+
         search_results.append({
             "chunk_id": results["ids"][0][index],
-            "text": results["documents"][0][index],
+            "text": text,
             "metadata": results["metadatas"][0][index],
             "distance": distance
         })
+
+        if len(search_results) >= top_k:
+            break
 
     return search_results
 

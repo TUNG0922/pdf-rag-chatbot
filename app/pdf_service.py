@@ -1,6 +1,7 @@
 
 import fitz
 
+from app import config
 from app.chunking_service import split_text_into_chunks
 
 
@@ -26,8 +27,8 @@ def extract_text_from_pdf(file_bytes: bytes):
 
         page_chunks = split_text_into_chunks(
             text=text,
-            chunk_size=500,
-            chunk_overlap=100
+            chunk_size=config.CHUNK_SIZE,
+            chunk_overlap=config.CHUNK_OVERLAP
         )
 
         for chunk_index, chunk_text in enumerate(page_chunks):

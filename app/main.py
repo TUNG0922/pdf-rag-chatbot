@@ -1,8 +1,23 @@
-import uuid
+﻿import uuid
+from typing import Literal
+import json
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel
-from app.rag_service import ask_question
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from app import config
+from app import user_service
+from app import auth_service
+from app.auth_service import get_current_user, require_admin, require_user
+from app.rag_service import (
+    ask_question,
+    retrieve_context,
+    NO_CONTEXT_ANSWER,
+    is_followup_question,
+)
+from app.llm_service import LLMUnavailableError, generate_title, stream_answer
 from app.pdf_service import extract_text_from_pdf
 from app.embedding_service import (
     generate_embedding,
@@ -21,16 +36,136 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Allow the frontend (served from a different origin) to call the API directly.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Ensure the users table exists as soon as the app module is imported,
+# regardless of how the app is launched (uvicorn, TestClient, etc.).
+user_service.init_db()
+
+
+@app.on_event("startup")
+def _startup():
+    # Re-ensure on startup as well (harmless if already created).
+    user_service.init_db()
+
 
 class EmbeddingRequest(BaseModel):
     text: str
 
 class SearchRequest(BaseModel):
     question: str
-    top_k: int = 3
+    top_k: int = Field(default=3, ge=1, le=10)
+    distance_threshold: float | None = Field(default=None, ge=0.0, le=2.0)
+
+class HistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
 class ChatRequest(BaseModel):
     question: str
-    top_k: int = 3
+    top_k: int = Field(default=3, ge=1, le=10)
+    distance_threshold: float | None = Field(default=None, ge=0.0, le=2.0)
+    # Prior conversation turns (most recent last), for memory + better retrieval.
+    history: list[HistoryMessage] = Field(default_factory=list)
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+    password: str = Field(min_length=6, max_length=128)
+    # Role chosen by the user at registration time. Defaults to a regular user.
+    role: Literal["user", "admin"] = "user"
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    username: str
+    role: str
+    # Access token lifetime in seconds (lets the client schedule refresh).
+    expires_in: int = config.JWT_EXPIRE_MINUTES * 60
+
+
+class UserResponse(BaseModel):
+    username: str
+    role: str
+
+
+@app.post("/api/auth/register", response_model=TokenResponse)
+def register(request: RegisterRequest):
+    # The account is created with the role the user selected (user or admin).
+    try:
+        user = user_service.create_user(
+            username=request.username,
+            password=request.password,
+            role=request.role,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    token = auth_service.create_access_token(
+        username=user["username"], role=user["role"]
+    )
+    return TokenResponse(
+        access_token=token,
+        username=user["username"],
+        role=user["role"],
+    )
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = user_service.authenticate(
+        username=form_data.username, password=form_data.password
+    )
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = auth_service.create_access_token(
+        username=user["username"], role=user["role"]
+    )
+    return TokenResponse(
+        access_token=token,
+        username=user["username"],
+        role=user["role"],
+    )
+
+
+@app.get("/api/auth/me", response_model=UserResponse)
+def me(current_user: dict = Depends(get_current_user)):
+    return UserResponse(
+        username=current_user["username"], role=current_user["role"]
+    )
+
+
+@app.post("/api/auth/refresh", response_model=TokenResponse)
+def refresh(current_user: dict = Depends(get_current_user)):
+    """
+    Issue a fresh access token for an already-authenticated (non-expired)
+    session. Used by the client for silent, proactive token refresh so the
+    user is not unexpectedly logged out mid-use.
+    """
+    token = auth_service.create_access_token(
+        username=current_user["username"], role=current_user["role"]
+    )
+    return TokenResponse(
+        access_token=token,
+        username=current_user["username"],
+        role=current_user["role"],
+    )
+
+
 @app.get("/")
 def root():
     return {
@@ -46,7 +181,10 @@ def health_check():
 
 
 @app.post("/api/pdf/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(
+    file: UploadFile = File(...),
+    _admin: dict = Depends(require_admin),
+):
 
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(
@@ -60,6 +198,15 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(
             status_code=400,
             detail="Uploaded PDF file is empty."
+        )
+
+    if len(file_bytes) > config.MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File too large. Maximum allowed size is "
+                f"{config.MAX_UPLOAD_MB} MB."
+            )
         )
 
     try:
@@ -152,7 +299,10 @@ def test_embedding(request: EmbeddingRequest):
         )
 
 @app.post("/api/search")
-def semantic_search(request: SearchRequest):
+def semantic_search(
+    request: SearchRequest,
+    _user: dict = Depends(require_user),
+):
 
     if not request.question.strip():
         raise HTTPException(
@@ -160,11 +310,11 @@ def semantic_search(request: SearchRequest):
             detail="Question cannot be empty."
         )
 
-    if request.top_k < 1 or request.top_k > 10:
-        raise HTTPException(
-            status_code=400,
-            detail="top_k must be between 1 and 10."
-        )
+    threshold = (
+        request.distance_threshold
+        if request.distance_threshold is not None
+        else config.DEFAULT_DISTANCE_THRESHOLD
+    )
 
     try:
         query_embedding = generate_embedding(
@@ -174,7 +324,7 @@ def semantic_search(request: SearchRequest):
         results = search_chunks(
             query_embedding=query_embedding,
             top_k=request.top_k,
-            distance_threshold=0.5
+            distance_threshold=threshold
         )
 
         # No sufficiently relevant chunks found
@@ -199,7 +349,10 @@ def semantic_search(request: SearchRequest):
         )
 
 @app.post("/api/chat")
-def chat_with_pdf(request: ChatRequest):
+def chat_with_pdf(
+    request: ChatRequest,
+    _user: dict = Depends(require_user),
+):
 
     if not request.question.strip():
         raise HTTPException(
@@ -207,16 +360,11 @@ def chat_with_pdf(request: ChatRequest):
             detail="Question cannot be empty."
         )
 
-    if request.top_k < 1 or request.top_k > 10:
-        raise HTTPException(
-            status_code=400,
-            detail="top_k must be between 1 and 10."
-        )
-
     try:
         result = ask_question(
             question=request.question,
-            top_k=request.top_k
+            top_k=request.top_k,
+            distance_threshold=request.distance_threshold
         )
 
         return {
@@ -225,14 +373,113 @@ def chat_with_pdf(request: ChatRequest):
             "sources": result["sources"]
         }
 
+    except LLMUnavailableError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=str(e)
+        )
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to generate answer: {str(e)}"
         )
 
+
+class TitleRequest(BaseModel):
+    question: str
+
+
+@app.post("/api/chat/title")
+def chat_title(
+    request: TitleRequest,
+    _user: dict = Depends(require_user),
+):
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    try:
+        title = generate_title(request.question)
+        return {"title": title}
+    except LLMUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to generate title: {str(e)}"
+        )
+
+
+@app.post("/api/chat/stream")
+def chat_stream(
+    request: ChatRequest,
+    _user: dict = Depends(require_user),
+):
+    """
+    Stream a RAG answer as newline-delimited JSON (NDJSON). Each line is one
+    JSON object:
+      {"type": "sources", "sources": [...]}   (sent first)
+      {"type": "token", "token": "..."}       (many)
+      {"type": "done"}                         (sent last)
+      {"type": "error", "detail": "..."}       (on failure)
+    """
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    def event_stream():
+        try:
+            history = [m.model_dump() for m in request.history]
+
+            context, sources = retrieve_context(
+                question=request.question,
+                top_k=request.top_k,
+                distance_threshold=request.distance_threshold,
+                history=history,
+            )
+
+            # For short follow-up questions ("more examples", "explain further"),
+            # the answer is driven by the conversation and the model's own
+            # knowledge rather than the retrieved excerpts, so the retrieved
+            # chunks are not a faithful attribution. Don't show Sources then.
+            followup = is_followup_question(request.question, history)
+            shown_sources = [] if followup else sources
+
+            # Always send sources first (empty when suppressed or none found).
+            yield json.dumps({"type": "sources", "sources": shown_sources}) + "\n"
+
+            if context is None:
+                if history:
+                    # Follow-up with no new chunks: answer using the prior
+                    # conversation instead of giving up.
+                    for piece in stream_answer(
+                        request.question, None, history
+                    ):
+                        yield json.dumps({"type": "token", "token": piece}) + "\n"
+                    yield json.dumps({"type": "done"}) + "\n"
+                    return
+                # Brand-new question with nothing relevant: canned message.
+                yield json.dumps(
+                    {"type": "token", "token": NO_CONTEXT_ANSWER}
+                ) + "\n"
+                yield json.dumps({"type": "done"}) + "\n"
+                return
+
+            for piece in stream_answer(request.question, context, history):
+                yield json.dumps({"type": "token", "token": piece}) + "\n"
+
+            yield json.dumps({"type": "done"}) + "\n"
+
+        except LLMUnavailableError as e:
+            yield json.dumps({"type": "error", "detail": str(e)}) + "\n"
+        except Exception as e:  # noqa: BLE001
+            yield json.dumps(
+                {"type": "error", "detail": f"Streaming failed: {str(e)}"}
+            ) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
 @app.get("/api/documents")
-def list_documents():
+def list_documents(_admin: dict = Depends(require_admin)):
 
     try:
         documents = get_documents()
@@ -249,7 +496,10 @@ def list_documents():
         )
 
 @app.delete("/api/documents/{document_id}")
-def remove_document(document_id: str):
+def remove_document(
+    document_id: str,
+    _admin: dict = Depends(require_admin),
+):
 
     try:
         deleted_chunks = delete_document(document_id)
