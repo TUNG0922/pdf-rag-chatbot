@@ -37,6 +37,7 @@ import {
 
 import { getToken, clearToken } from "../services/api";
 import type { ChatMessage, ChatSource } from "../hooks/useConversations";
+import MarkdownErrorBoundary from "./MarkdownErrorBoundary";
 
 /**
  * Renders markdown code. Fenced blocks get a header (language + copy button)
@@ -180,6 +181,14 @@ function ChatInterface({
   const [error, setError] = useState("");
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
+  // Id of the assistant message currently being streamed. While streaming we
+  // render plain text (partial markdown such as an unclosed code fence can
+  // crash the markdown renderer); once done we render full markdown.
+  const [streamingId, setStreamingId] = useState<number | null>(null);
+  // Live text of the in-progress stream, kept in local state and flushed on a
+  // rAF tick so we don't call the parent's setState on every single token
+  // (which caused "Maximum update depth exceeded").
+  const [streamingContent, setStreamingContent] = useState("");
   const viewportRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -187,7 +196,7 @@ function ChatInterface({
       top: viewportRef.current.scrollHeight,
       behavior: "smooth",
     });
-  }, [messages, loading]);
+  }, [messages, loading, streamingContent]);
 
   const handleSendMessage = async () => {
     const trimmed = question.trim();
@@ -223,6 +232,7 @@ function ChatInterface({
     const base = [...priorMessages, userMessage, assistantMessage];
     onMessagesChange(base);
     setLoading(true);
+    setStreamingId(assistantId);
     setError("");
 
     // Ask for a smart title based on what was actually asked.
@@ -234,7 +244,21 @@ function ChatInterface({
     let streamedSources: ChatSource[] | undefined;
     let sawError = false;
 
-    const applyAssistant = () => {
+    // Reset the live stream buffer for this turn.
+    setStreamingContent("");
+    let rafScheduled = false;
+    const scheduleFlush = () => {
+      if (rafScheduled) return;
+      rafScheduled = true;
+      requestAnimationFrame(() => {
+        rafScheduled = false;
+        setStreamingContent(streamedContent);
+      });
+    };
+
+    // Persist the final assistant message to the parent store ONCE (not per
+    // token) to avoid a setState storm.
+    const persistFinal = () => {
       onMessagesChange([
         ...priorMessages,
         userMessage,
@@ -315,7 +339,7 @@ function ChatInterface({
             streamedSources = evt.sources;
           } else if (evt.type === "token") {
             streamedContent += evt.token ?? "";
-            applyAssistant();
+            scheduleFlush();
           } else if (evt.type === "error") {
             sawError = true;
             setError(evt.detail || "The assistant is unavailable.");
@@ -340,7 +364,8 @@ function ChatInterface({
         }
       }
 
-      applyAssistant();
+      setStreamingContent(streamedContent);
+      persistFinal();
 
       // Only show the generic error if the stream produced nothing AND no
       // explicit error event was received during this request.
@@ -349,9 +374,12 @@ function ChatInterface({
       }
     } catch (err) {
       console.error("Chat stream failed:", err);
-      setError("Unable to get an answer. Please try again.");
+      const msg =
+        err instanceof Error ? err.message : String(err);
+      setError(`Unable to get an answer: ${msg}`);
     } finally {
       setLoading(false);
+      setStreamingId(null);
     }
   };
 
@@ -453,12 +481,24 @@ function ChatInterface({
                   className="markdown-body"
                 >
                   {message.role === "assistant" ? (
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      components={mdComponents}
-                    >
-                      {message.content}
-                    </ReactMarkdown>
+                    streamingId === message.id ? (
+                      // While streaming, show plain text from local buffer —
+                      // partial markdown (e.g. an unclosed code fence) can
+                      // crash the renderer, and using local state avoids a
+                      // parent setState per token.
+                      <Text style={{ whiteSpace: "pre-wrap" }}>
+                        {streamingContent}
+                      </Text>
+                    ) : (
+                      <MarkdownErrorBoundary fallbackText={message.content}>
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          components={mdComponents}
+                        >
+                          {message.content}
+                        </ReactMarkdown>
+                      </MarkdownErrorBoundary>
+                    )
                   ) : editingId === message.id ? (
                     <Stack gap="xs">
                       <Textarea

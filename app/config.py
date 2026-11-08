@@ -45,10 +45,12 @@ CHUNK_OVERLAP = _get_int("CHUNK_OVERLAP", 100)
 # --- Retrieval --------------------------------------------------------------
 # Default cosine-distance threshold used to filter out irrelevant chunks.
 # Lower = stricter. Can be overridden per request.
-# The multilingual MiniLM model places genuinely relevant chunks around
-# 0.6-0.7, so 0.75 keeps relevant content while still rejecting off-topic
-# chatter (which tends to sit at 0.85+).
-DEFAULT_DISTANCE_THRESHOLD = _get_float("DEFAULT_DISTANCE_THRESHOLD", 0.75)
+# The multilingual MiniLM model places genuinely relevant chunks up to ~0.78
+# (mixed-language questions sit higher, e.g. a Chinese+English question can
+# score ~0.75), while clearly off-topic chatter sits at ~0.85+. 0.80 keeps
+# relevant content (including mixed-language queries) while still rejecting
+# unrelated questions.
+DEFAULT_DISTANCE_THRESHOLD = _get_float("DEFAULT_DISTANCE_THRESHOLD", 0.80)
 
 # --- Models -----------------------------------------------------------------
 EMBEDDING_MODEL = os.getenv(
